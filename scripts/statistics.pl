@@ -29,7 +29,7 @@ my $HERE = dirname(__FILE__);
 #my $cmdNonDuplicates = "samtools view -F 0x400 2695.markDup.bam | wc -l";	# the number of non-duplicate reads (100% mapped)
 #my $cmdMappedReads = "samtools view -F 0x4 2695.markDup.bam | wc -l";		# the number of mapped reads
 
-my $BAMSTAT = "java -jar /home/ngsknecht/bin/picard/dist/BamIndexStats.jar QUIET=true";
+my $BAMSTAT = "java picard.sam.BamIndexStats QUIET=true";
 my $BEDCOV = "/home/ngsknecht/bin/bedtools2/bin/coverageBed -hist";
 my $PLOTCOV = "Rscript $HERE/plotCoverage.R";
 my $CALCCOV = "perl $HERE/calcCoverageFraction.pl -t 100 -i";
@@ -48,9 +48,9 @@ my $rmDup;
 
 ## Statistics
 
-my $nUnaligned;
-my $nAligned;
-my $nDuplicates;
+my $nUnaligned = 0;
+my $nAligned = 0;
+my $nDuplicates = 0;
 
 GetOptions(	'bam|b=s'	=> \$bam,
 		'out|o=s'	=> \$outputprefix,
@@ -113,7 +113,7 @@ sub calcMapping{
 sub calcDuplicates{
 	$nDuplicates = `samtools view -f 0x400 $bam | wc -l`;
 	chomp($nDuplicates);
-	printf (STA "duplicates:\t%d\nduplication rate:\t%.2f\n",$nDuplicates,100.0/$nAligned*$nDuplicates);
+	printf (STA "duplicates:\t%d\nduplication rate:\t%.2f\n",$nDuplicates,100.0/($nAligned == 0 ? 1 : $nAligned)*$nDuplicates);
 }
 
 

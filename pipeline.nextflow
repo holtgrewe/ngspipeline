@@ -5,7 +5,8 @@ import FastQC
 import PathUtil
 import PipelinePaths
 
-//echo true
+// Uncomment for seeing the output of th eprocesses.
+echo true
 
 params.runID = 1234
 params.baseDir = "$HOME/Projects/nextflow-test"
@@ -37,7 +38,7 @@ readPairs.separate(readPairsFastQCOriginal, readPairsRunTrimming) { x -> [ x, x 
 
 process runFastQCOriginal {
     cpus params.cpus.mapping
-    // module 'fastqc/0.11.2'
+    module 'fastqc/0.11.2'
 
     input:
     set pairID, file(readL), file(readR) from readPairsFastQCOriginal
@@ -57,7 +58,7 @@ process runFastQCOriginal {
 // TODO(holtgrew): I would like to have the output file both in the result permanently and in the output channel...
 process runTrimming {
 	cpus params.cpus.trimming
-	// module 'skewer/0.1.120'
+	module "skewer/0.1.120"
 
 	input:
 	set pairID, file(readL), file(readR) from readPairsRunTrimming
@@ -100,7 +101,7 @@ readPairsTrimmed.separate(readPairsFastQCTrimmed, readPairsRunMapping) { x -> [ 
 
 process runFastQCOriginal {
 	cpus params.cpus.mapping
-	// module 'fastqc/0.11.2'
+	module "fastqc/0.11.2"
 
 	input:
 	set pairID, file(readL), file(readR) from readPairsFastQCTrimmed
@@ -123,7 +124,7 @@ process runFastQCOriginal {
 // BWA-MEM variant
 process runReadMapping {
 	cpus params.cpus.mapping
-	// module 'bwa/0.7.2'
+	module "bwa/0.7.10"
 
 	input:
 	set pairID, readL, readR from readPairsRunMapping
@@ -133,7 +134,7 @@ process runReadMapping {
 
 	"""
 	set -x
-	bwa mem -R '@RG\tID:${params.runID}\tSM:${params.runID}' -t ${params.cpus.mapping} ${genomeFile} ${readL} ${readR} | samtools view -Sb - | samtools sort - alignment
+	bwa mem -R '@RG\\tID:${params.runID}\\tSM:${params.runID}' -t ${params.cpus.mapping} ${genomeFile} ${readL} ${readR} | samtools view -Sb - | samtools sort - alignment
 	"""
 }
 
@@ -145,15 +146,18 @@ process runReadMapping {
 jointBams = bamFiles.map{f -> [1, f] }.groupTuple()  // concatenate these files
 
 process runMergeAndMarkDuplicates {
-	// TODO(holtgrew): Add duplicated marking to process.
 	cpus params.cpus.merging
+	module "samtools/1.1"
+	module "picard-tools/1.125"
 
 	input:
 	set ignored, bamFiles from jointBams
 
 	output:
-	file paths.bamPath(params.runID + ".bam") into rawAlignment
-	// file paths.bamPath(params.runID + ".bam.bai") into rawAlignmentBAI
+	file paths.bamPath(params.runID + ".bam") into deduplicatedAlignment
+	file paths.bamPath(params.runID + ".mkdup.bam") into markedAlignment
+	file paths.bamPath(params.runID + ".mkdup.bam.bai") into markedAlignmentBAI
+	file paths.bamPath(params.runID + ".mkdup.bam.metrics") into markedAlignmentMetrics
 
 	"""
 	#!/bin/bash
@@ -162,43 +166,80 @@ process runMergeAndMarkDuplicates {
 	# count number of files
 	FILES="${bamFiles.join(" ")}"
 	FILES=( \$FILES )
-	# copy one file but merge multiple files
+	## MERGE FILES (or copy if single file)
 	if [[ \${#FILES[@]} -gt 1 ]]; then
-		samtools merge -f ${paths.bamPath(params.runID)}.bam ${bamFiles.join(" ")}
+		samtools merge -f merged.bam ${bamFiles.join(" ")}
 	else
-		cp ${bamFiles.join(" ")} ${paths.bamPath(params.runID)}.bam
+		cp \${FILES} merged.bam
 	fi
-	samtools index ${paths.bamPath(params.runID)}.bam
+	## FIX HEADER
+	# Prepend "@HD\tVN:1.5\tSO:coordinate", since samtools does not do so.
+	echo -e "@HD\tVN:1.5\tSO:coordinate" > header.sam
+	samtools view -H merged.bam >> header.sam
+	samtools reheader header.sam merged.bam > ${paths.bamPath(params.runID)}.bam
+	## MARK DUPLICATES
+	java -Xmx32G picard.sam.markduplicates.MarkDuplicates INPUT=${paths.bamPath(params.runID)}.bam OUTPUT=${paths.bamPath(params.runID + ".mkdup.bam")} METRICS_FILE=${paths.bamPath(params.runID + ".mkdup.bam.metrics")} CREATE_INDEX=true
+	mv ${paths.bamPath(params.runID + ".mkdup.bai")} ${paths.bamPath(params.runID + ".mkdup.bam.bai")}
 	"""
 }
 
 // --------------------------------------------------------------------------
-// Run BAM Postprocessing
+// Run BAM Realignment
 // --------------------------------------------------------------------------
 
-process runBAMPostprocessing {
-	// TODO(holtgrew): Add duplicated marking to process.
-	echo true
+// Note that we are using time before the java commands below because otherwise, we do not get a per-command time report.
+
+process runBAMRealignment {
 	cpus params.cpus.postproc
+	module 'gatk/3.3-0'
 
 	input:
-	file bamFile from rawAlignment
+	file bamFile from markedAlignment
+	file baiFile from markedAlignmentBAI
 
 	output:
-	// TODO(holtgrew): I'd rather have the following here:
-	//     file paths.bamPath(bamFile, "ra") into realignmentBAM 
+	// TODO(holtgrew): I'd rather have the following here, instead I have to write to global file system and link these files into the work directory
+	//     file paths.bamPath(bamFile, "ra") into realignmentBAM
+	file "${bamFile}.intervals" into realignmentIntervals
 	file "${bamFile}.ra.bam" into realignmentBAM
+	file "${bamFile}.ra.bam.bai" into realignmentBAI
+
+	"""
+	set -x
+	# create realignment target intervals
+	time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T RealignerTargetCreator -R ${genomeFile} --known ${params.oneKGenomes} --known ${params.mills} -nt ${params.cpus.postproc} -I ${bamFile} -o ${bamFile}.realign_intervals
+	cp ${bamFile}.realign_intervals ${paths.bamPath(bamFile)}.intervals
+	# perform indel realignment
+	time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T IndelRealigner -R ${genomeFile} -known ${params.oneKGenomes} -known ${params.mills} -I ${bamFile} -o ${paths.bamPath(bamFile, "ra")} --targetIntervals ${bamFile}.intervals
+	ln -s ${paths.bamPath(bamFile, "ra")} ${bamFile}.ra.bam
+	ln -s ${paths.bamPath(bamFile, "ra")}.bai ${bamFile}.ra.bam.bai
+	"""
+}
+
+// --------------------------------------------------------------------------
+// Run BAM Recalibration
+// --------------------------------------------------------------------------
+
+process runBAMRecalibration {
+	cpus params.cpus.postproc
+	module 'gatk/3.3-0'
+
+	input:
+	file bamFile from realignmentBAM
+	file baiFile from realignmentBAI
+
+	output:
+	// TODO(holtgrew): I'd rather have the following here, instead I have to write to global file system and link these files into the work directory
+	//     file paths.bamPath(bamFile, "ra") into realignmentBAM
 	file "${bamFile}.ra.rc.bam" into finalBAM
 	file "${bamFile}.ra.rc.bam.bai" into finalBAI
 
 	"""
 	set -x
-	mkdir -p `dirname ${paths.bamPath(params.runID)}`
-	cp ${bamFile} ${paths.bamPath(bamFile, "ra")}
-	ln -s ${paths.bamPath(bamFile, "ra")} ${bamFile}.ra.bam
-	cp ${bamFile} ${paths.bamPath(bamFile, "ra.rc")}
+	# perform base recalibration, then print reads
+	time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T BaseRecalibrator -R ${genomeFile}.fasta -knownSites ${params.dbSnp} -nct ${params.cpus.postprocessing} -I ${paths.bamPath(bamFile, "ra")} -o ${bamFile}.recal
+	time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T PrintReads -R ${genomeFile}.fasta --BQSR ${bamFile}.recal -nct ${params.cpus.postproc} -I ${paths.bamPath(bamFile, "ra")} -o ${paths.bamPath(bamFile, "ra.rc")}
 	ln -s ${paths.bamPath(bamFile, "ra.rc")} ${bamFile}.ra.rc.bam
-	samtools index ${paths.bamPath(bamFile, "ra.rc")}
 	ln -s ${paths.bamPath(bamFile, "ra.rc")}.bai ${bamFile}.ra.rc.bam.bai
 	"""
 }
@@ -211,11 +252,10 @@ process runBAMPostprocessing {
 // --------------------------------------------------------------------------
 
 process runCoverageAnalysis {
-	echo true
 	cpus params.cpus.qualimap
-	// module "samtools" 
-	// module "picard-tools"
-	// module "bedtools2"
+	module "samtools/1.1" 
+	module "picard-tools/1.125"
+	module "bedtools2/2.22.0"
 
 	input:
 	file bamFile from finalBAMForCoverage
@@ -228,10 +268,8 @@ process runCoverageAnalysis {
 	set -x
 	# create output directory
 	mkdir -p ${paths.reportPath("cov", params.runID)}
-    # create coverage report
-    statistics.pl -r \$HOME/Resource/BED/CCDS/CCDS.20140728.merged.short.bed -b ${bamFile} -o ${paths.reportPath("cov", params.runID)}/${params.runID} -d 
-	# create quality report with Qualimap
-	qualimap bamqc --java-mem-size=10G -c -gd HUMAN -os -nt ${params.cpus.qualimap} -gff ${params.ccdsBED} -bam ${bamFile} -outdir ${paths.reportPath("qualimap", params.runID)}/`basename ${bamFile}` 
+	# create coverage report
+	${params.pipelineDir}/scripts/statistics.pl -r ${params.ccdsBED} -b ${bamFile} -o ${paths.reportPath("cov", params.runID)}/${params.runID} -d 
 	"""
 }
 
@@ -240,9 +278,8 @@ process runCoverageAnalysis {
 // --------------------------------------------------------------------------
 
 process runQualimap {
-	echo true
 	cpus params.cpus.qualimap
-	// module "qualimap/2.0"
+	module "qualimap/2.0"
 
 	input:
 	file bamFile from finalBAMForQualimap
@@ -261,21 +298,21 @@ process runQualimap {
 }
 
 // --------------------------------------------------------------------------
-// Run Variant Calling on finalBAM
+// Run Variant Calling on Postprocessed BAM File
 // --------------------------------------------------------------------------
 
-// TODO(holtgrwe): Adjust postprocessing.
+// TODO(holtgrewe): Put postprocessing into its own process.
 
 process runVariantCalling {
-	echo true
 	cpus params.cpus.variantCalling
+	module 'gatk/3.3-0'
 
 	input:
 	file bamFile from finalBAMForVariantCalling
 	file baiFile from finalBAIForVariantCalling
 
 	output:
-//	file "${params.runID}.vcf" into rawVCF
+	file "${bamFile}.vcf" into rawVCF
 //	file "${params.runID}.jv.vcf" into jannovarVCF
 //	file "${params.runID}.jv.ccds.vcf" into ccdsJannovarVCF
 
@@ -284,14 +321,31 @@ process runVariantCalling {
 	set -x
 	# create output directory
 	mkdir -p `dirname ${paths.vcfPath(params.runID)}`
-	# call variants with Samtools
-	samtools mpileup -uf ${genomeFile} ${bamFile} | bcftools view -vcg - > ${paths.vcfPath(params.runID + ".vcf")}
-	ln -s ${paths.vcfPath(params.runID + ".vcf")} ${params.runID}.vcf
-	# annotate variants with Jannovar
-	cp ${paths.vcfPath(params.runID + ".vcf")} ${paths.vcfPath(params.runID + ".vcf", "jv")}
-	ln -s ${paths.vcfPath(params.runID + ".vcf", "jv")} ${params.runID}.jv.vcf
-	# delimit variants file to CCDS
-	cp ${paths.vcfPath(params.runID + ".vcf")} ${paths.vcfPath(params.runID + ".vcf", "jv.ccds")}
-	ln -s ${paths.vcfPath(params.runID + ".vcf", "jv.ccds")} ${params.runID}.jv.ccds.vcf
+	# call variants with GATK's UnifiedGenotyper
+	java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T UnifiedGenotyper -R ${genomeFile}.fasta -allowPotentiallyMisencodedQuals -glm BOTH --dbsnp ${params.dbSnp} -dcov 200 -I ${bamFile} -nct ${params.cpus.variantCalling} -o ${paths.vcfPath(params.runID + ".vcf")}
+	ln -s ${paths.vcfPath(params.runID + ".vcf")} ${bamFile}.vcf
 	"""
 }
+
+// --------------------------------------------------------------------------
+// Run Postprocessing on VCF File
+// --------------------------------------------------------------------------
+
+/* CURRENTLY DISABLED
+process runVCFPostprocessing {
+	cpus params.cpus.vcfPostprocess
+	
+	input:
+	file vcfFile from rawVCF
+	
+	output:
+	// file "${vcfFile}.jv.vcf" into jannovarVCF
+	// file "${vcfFile}.jv.ccds.vcf" into ccdsJannovarVCF
+	
+	script:
+	"""
+	set -x
+	# TODO(holtgrem): RUN
+	"""
+}
+*/
