@@ -1,118 +1,119 @@
 #!/usr/bin/env nextflow
 
+import CopyHelper
 import ChannelUtil
 import FastQC
 import PathUtil
-import PipelinePaths
 
-// Uncomment for seeing the output of th eprocesses.
-echo true
+// Uncomment for seeing the output of the processes.
+if (params.verbose)
+    echo true
 
-params.runID = 1234
-params.baseDir = "$HOME/Projects/nextflow-test"
-
-// Create helper for generating pipeline file paths. 
-paths = new PipelinePaths(params.baseDir);
+// Create helper for copying files.
+copyHelper = new CopyHelper(params.baseDir, params.printCopyMsgs)
 
 // Open channel for left and right files and merge it into triples, the
 // first entry is the LCS of the file names that can be used as a read
 // pair identifier.
 readPairs = ChannelUtil.createFilePairChannel(
-		Channel.fromPath(paths.fastqPattern("original", "R1")),
-		Channel.fromPath(paths.fastqPattern("original", "R2"))
-		)
+        params.runID,
+        Channel.fromPath([params.baseDir, "fastq", "original", "*R1*"].join(File.separator)),
+        Channel.fromPath([params.baseDir, "fastq", "original", "*R2*"].join(File.separator)),
+        )
 
 // Genome file.
-// TODO(holtgrew): Is this really required or could we as well use the path?
 genomeFile = file(params.genome)
 
 // Duplicate the read pairs into one queue for runFastQCOriginal
 // and runTrimming.
-readPairsFastQCOriginal = Channel.create()
-readPairsRunTrimming = Channel.create()
-readPairs.separate(readPairsFastQCOriginal, readPairsRunTrimming) { x -> [ x, x ] }
+(readPairsFastQCOriginal,
+ readPairsRunTrimming) = readPairs.separate(2) { x -> [x, x] }
 
 // --------------------------------------------------------------------------
 // Run FastQC on the original reads.
 // --------------------------------------------------------------------------
 
 process runFastQCOriginal {
-    cpus params.cpus.mapping
+    cpus params.cpus.fastqc
     module 'fastqc/0.11.2'
 
     input:
-    set pairID, file(readL), file(readR) from readPairsFastQCOriginal
+    set runID, file(readL), file(readR) from readPairsFastQCOriginal
+
+    output:
+    set file('*.zip'), file('*.html') into fastqcOutputOriginal
 
     script:
     """
     set -x
-    mkdir -p ${paths.fastqcPath("original", pairID)}
-    fastqc -o ${paths.fastqcPath("original", pairID)} ${readL} ${readR}
+    fastqc -t ${params.cpus.fastqc} -o . ${readL} ${readR}
     """
 }
+
+copyHelper.copyFiles(fastqcOutputOriginal, "fastqc/original");
 
 // --------------------------------------------------------------------------
 // Run read trimming on the original reads 
 // --------------------------------------------------------------------------
 
-// TODO(holtgrew): I would like to have the output file both in the result permanently and in the output channel...
 process runTrimming {
-	cpus params.cpus.trimming
-	module "skewer/0.1.120"
+    cpus params.cpus.trimming
+    module "skewer/0.1.120"
 
-	input:
-	set pairID, file(readL), file(readR) from readPairsRunTrimming
+    input:
+    set runID, file(readL), file(readR) from readPairsRunTrimming
 
-	output:
-    set pairID, "${readL}.tr.gz", "${readR}.tr.gz" into readPairsTrimmed
+    output:
+    set runID, file("out/${readL}"), file("out/${readR}") into readPairsTrimmed
+    set file("*.log") into trimmingLogs
 
-	script:
-	"""
-	set -x
-	mkdir -p ${paths.logPath("trimming")}
-
+    script:
+    """
+    set -x
     # call Skewer
-	skewer -m pe -z -t ${params.cpus.trimming} ${readL} ${readR}
-	# compute name of left/right Skewer result file
-	NAMEBASE=${readL}
-	LEFT=\${NAMEBASE%.gz}-trimmed-pair1.fastq.gz
-	RIGHT=\${NAMEBASE%.gz}-trimmed-pair2.fastq.gz
-	# move Skewer output to expected file names
-	mkdir -p `dirname ${paths.fastqPath("trimmed", readL.getName())}`
-	mv \${LEFT} ${paths.fastqPath("trimmed", readL.getName())}
-	mv \${RIGHT} ${paths.fastqPath("trimmed", readR.getName())}
-	# create links to the result files so we can pass them on
-	ln -s ${paths.fastqPath("trimmed", readL.getName())} ${readL}.tr.gz
-	ln -s ${paths.fastqPath("trimmed", readR.getName())} ${readR}.tr.gz
-	# save logs
-	cp *.log ${paths.logPath("trimming")}
-	"""
+    skewer -m pe -z -t ${params.cpus.trimming} ${readL} ${readR}
+    # compute name of left/right Skewer result file
+    NAMEBASE=${readL}
+    LEFT=\${NAMEBASE%.gz}-trimmed-pair1.fastq.gz
+    RIGHT=\${NAMEBASE%.gz}-trimmed-pair2.fastq.gz
+    # move Skewer output to expected file names
+    mkdir -p out
+    mv \${LEFT} out/${readL}
+    mv \${RIGHT} out/${readR}
+    """
 }
 
-// Duplicate the read pairs into one queue for runFastQCTrimmed
-// and runMapping.
-readPairsFastQCTrimmed = Channel.create()
-readPairsRunMapping = Channel.create()
-readPairsTrimmed.separate(readPairsFastQCTrimmed, readPairsRunMapping) { x -> [ x, x ] }
+// Duplicate the read pairs into multiple queues for processing / copying out.
+(readPairsFastQCTrimmed,
+ readPairsRunMapping,
+ readPairsTrimmedCopyOut) = readPairsTrimmed.separate(3) { x -> [ x, x, x ] }
+
+// Copy out results from trimming step (map removes the pair).
+copyHelper.copyFiles(trimmingLogs, "reports/trimming");
+copyHelper.copyFiles(readPairsTrimmedCopyOut.map { [it[1], it[2]] }, "fastq/trimmed");
 
 // --------------------------------------------------------------------------
 // Run FastQC on the trimmed reads.
 // --------------------------------------------------------------------------
 
-process runFastQCOriginal {
-	cpus params.cpus.mapping
-	module "fastqc/0.11.2"
+process runFastQCTrimmed {
+    cpus params.cpus.fastqc
+    module 'fastqc/0.11.2'
 
-	input:
-	set pairID, file(readL), file(readR) from readPairsFastQCTrimmed
+    input:
+    set runID, file(readL), file(readR) from readPairsFastQCTrimmed
 
-	script:
-	"""
-	set -x
-	mkdir -p ${paths.fastqcPath("trimmed", pairID)}
-	fastqc -o ${paths.fastqcPath("trimmed", pairID)} ${readL} ${readR}
-	"""
+    output:
+    set file('*.zip'), file('*.html') into fastqcOutputTrimmed
+
+    script:
+    """
+    set -x
+    fastqc -t ${params.cpus.fastqc} -o . ${readL} ${readR}
+    """
 }
+
+copyHelper.copyFiles(fastqcOutputTrimmed, "fastqc/trimmed");
 
 // --------------------------------------------------------------------------
 // Run Read Mapping
@@ -123,229 +124,151 @@ process runFastQCOriginal {
 
 // BWA-MEM variant
 process runReadMapping {
-	cpus params.cpus.mapping
-	module "bwa/0.7.10"
+    cpus params.cpus.mapping
+    module "bwa/0.7.10"
+    module "samtools/1.1"
 
-	input:
-	set pairID, readL, readR from readPairsRunMapping
+    input:
+    genomeFile
+    set runID, readL, readR from readPairsRunMapping
 
-	output:
-	set file('alignment.bam') into bamFiles
+    output:
+    set file('alignment.bam') into bamFiles
 
-	"""
-	set -x
-	bwa mem -R '@RG\\tID:${params.runID}\\tSM:${params.runID}' -t ${params.cpus.mapping} ${genomeFile} ${readL} ${readR} | samtools view -Sb - | samtools sort - alignment
-	"""
+    """
+    set -x
+    bwa mem -R '@RG\\tID:${runID}\\tSM:${runID}' -t ${params.cpus.alignment.map} ${genomeFile} ${readL} ${readR} | samtools view -Sb -u - | samtools sort -@ ${params.cpus.alignment.sort} -m 1G - alignment
+    """
 }
 
 // --------------------------------------------------------------------------
 // Merge Reads and Mark Duplicates
 // --------------------------------------------------------------------------
 
-// TODO(holtgrew): Somehow, we have to use groupTuple() here and toList()/toSortedList() does not work
-jointBams = bamFiles.map{f -> [1, f] }.groupTuple()  // concatenate these files
+// TODO(holtgrew): We inject the runID name here since we cannot use global variables in input files yet (bug #18).
+jointBams = bamFiles.map{f -> [params.runID, f] }.groupTuple()  // concatenate these files
 
 process runMergeAndMarkDuplicates {
-	cpus params.cpus.merging
-	module "samtools/1.1"
-	module "picard-tools/1.125"
+    cpus params.cpus.postproc
+    module "samtools/1.1"
+    module "picard-tools/1.125"
 
-	input:
-	set ignored, bamFiles from jointBams
+    input:
+    set runID, bamFiles from jointBams
 
-	output:
-	file paths.bamPath(params.runID + ".bam") into deduplicatedAlignment
-	file paths.bamPath(params.runID + ".mkdup.bam") into markedAlignment
-	file paths.bamPath(params.runID + ".mkdup.bam.bai") into markedAlignmentBAI
-	file paths.bamPath(params.runID + ".mkdup.bam.metrics") into markedAlignmentMetrics
-
-	"""
-	#!/bin/bash
-	set -x
-	mkdir -p `dirname ${paths.bamPath(params.runID)}`
-	# count number of files
-	FILES="${bamFiles.join(" ")}"
-	FILES=( \$FILES )
-	## MERGE FILES (or copy if single file)
-	if [[ \${#FILES[@]} -gt 1 ]]; then
-		samtools merge -f merged.bam ${bamFiles.join(" ")}
-	else
-		cp \${FILES} merged.bam
-	fi
-	## FIX HEADER
-	# Prepend "@HD\tVN:1.5\tSO:coordinate", since samtools does not do so.
-	echo -e "@HD\tVN:1.5\tSO:coordinate" > header.sam
-	samtools view -H merged.bam >> header.sam
-	samtools reheader header.sam merged.bam > ${paths.bamPath(params.runID)}.bam
-	## MARK DUPLICATES
-	java -Xmx32G picard.sam.markduplicates.MarkDuplicates INPUT=${paths.bamPath(params.runID)}.bam OUTPUT=${paths.bamPath(params.runID + ".mkdup.bam")} METRICS_FILE=${paths.bamPath(params.runID + ".mkdup.bam.metrics")} CREATE_INDEX=true
-	mv ${paths.bamPath(params.runID + ".mkdup.bai")} ${paths.bamPath(params.runID + ".mkdup.bam.bai")}
-	"""
+    output:
+    file("${runID}.mkdup.*") into finalAlignmentsOut
+    set runID, file("${runID}.mkdup.bam"), file("${runID}.mkdup.bai") into finalAlignments
+    """
+    #!/bin/bash
+    set -x
+    # count number of files, merge multiple files and copy single file
+    FILES="${bamFiles.join(" ")}"
+    FILES=( \$FILES )
+    if [[ \${#FILES[@]} -gt 1 ]]; then
+        samtools merge -f merged.bam ${bamFiles.join(" ")}
+    else
+        cp \${FILES} merged.bam
+    fi
+    # fix header, prepend "@HD\tVN:1.5\tSO:coordinate", since samtools does not do so.
+    echo -e "@HD\tVN:1.5\tSO:coordinate" > header.sam
+    samtools view -H merged.bam >> header.sam
+    samtools reheader header.sam merged.bam > ${runID}.bam
+    # mark duplicates
+    java -Xmx32G picard.sam.markduplicates.MarkDuplicates INPUT=${runID}.bam OUTPUT=${runID}.mkdup.bam METRICS_FILE=${runID}.mkdup.metrics CREATE_INDEX=true
+    """
 }
 
-// --------------------------------------------------------------------------
-// Run BAM Realignment
-// --------------------------------------------------------------------------
+copyHelper.copyFiles(finalAlignmentsOut, "bam");
 
-// Note that we are using time before the java commands below because otherwise, we do not get a per-command time report.
-
-process runBAMRealignment {
-	cpus params.cpus.postproc
-	module 'gatk/3.3-0'
-
-	input:
-	file bamFile from markedAlignment
-	file baiFile from markedAlignmentBAI
-
-	output:
-	// TODO(holtgrew): I'd rather have the following here, instead I have to write to global file system and link these files into the work directory
-	//     file paths.bamPath(bamFile, "ra") into realignmentBAM
-	file "${bamFile}.intervals" into realignmentIntervals
-	file "${bamFile}.ra.bam" into realignmentBAM
-	file "${bamFile}.ra.bam.bai" into realignmentBAI
-
-	"""
-	set -x
-	# create realignment target intervals
-	time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T RealignerTargetCreator -R ${genomeFile} --known ${params.oneKGenomes} --known ${params.mills} -nt ${params.cpus.postproc} -I ${bamFile} -o ${bamFile}.realign_intervals
-	cp ${bamFile}.realign_intervals ${paths.bamPath(bamFile)}.intervals
-	# perform indel realignment
-	time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T IndelRealigner -R ${genomeFile} -known ${params.oneKGenomes} -known ${params.mills} -I ${bamFile} -o ${paths.bamPath(bamFile, "ra")} --targetIntervals ${bamFile}.intervals
-	ln -s ${paths.bamPath(bamFile, "ra")} ${bamFile}.ra.bam
-	ln -s ${paths.bamPath(bamFile, "ra")}.bai ${bamFile}.ra.bam.bai
-	"""
-}
-
-// --------------------------------------------------------------------------
-// Run BAM Recalibration
-// --------------------------------------------------------------------------
-
-process runBAMRecalibration {
-	cpus params.cpus.postproc
-	module 'gatk/3.3-0'
-
-	input:
-	file bamFile from realignmentBAM
-	file baiFile from realignmentBAI
-
-	output:
-	// TODO(holtgrew): I'd rather have the following here, instead I have to write to global file system and link these files into the work directory
-	//     file paths.bamPath(bamFile, "ra") into realignmentBAM
-	file "${bamFile}.ra.rc.bam" into finalBAM
-	file "${bamFile}.ra.rc.bam.bai" into finalBAI
-
-	"""
-	set -x
-	# perform base recalibration, then print reads
-	time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T BaseRecalibrator -R ${genomeFile}.fasta -knownSites ${params.dbSnp} -nct ${params.cpus.postprocessing} -I ${paths.bamPath(bamFile, "ra")} -o ${bamFile}.recal
-	time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T PrintReads -R ${genomeFile}.fasta --BQSR ${bamFile}.recal -nct ${params.cpus.postproc} -I ${paths.bamPath(bamFile, "ra")} -o ${paths.bamPath(bamFile, "ra.rc")}
-	ln -s ${paths.bamPath(bamFile, "ra.rc")} ${bamFile}.ra.rc.bam
-	ln -s ${paths.bamPath(bamFile, "ra.rc")}.bai ${bamFile}.ra.rc.bam.bai
-	"""
-}
-
-(finalBAMForCoverage, finalBAMForQualimap, finalBAMForVariantCalling) = finalBAM.separate(3) { x -> [ x, x, x ] }
-(finalBAIForCoverage, finalBAIForQualimap, finalBAIForVariantCalling) = finalBAI.separate(3) { x -> [ x, x, x ] }
+(finalAlignmentForCoverage,
+ finalAlignmentForQualimap,
+ finalAlignmentForVariantCalling) = finalAlignments.separate(3) { x -> [ x, x, x ] }
 
 // --------------------------------------------------------------------------
 // Run BAM Coverage Tools on finalBAM
 // --------------------------------------------------------------------------
 
 process runCoverageAnalysis {
-	cpus params.cpus.qualimap
-	module "samtools/1.1" 
-	module "picard-tools/1.125"
-	module "bedtools2/2.22.0"
+    cpus params.cpus.qualimap
+    module "samtools/1.1" 
+    module "picard-tools/1.125"
+    module "bedtools2/2.22.0"
 
-	input:
-	file bamFile from finalBAMForCoverage
-	file baiFile from finalBAIForCoverage
+    input:
+    set runID, file(bamFile), file(baiFile) from finalAlignmentForCoverage
 
-	output:
+    output:
+    file("${runID}.*") into coverageReportOut
 
-	script:
-	"""
-	set -x
-	# create output directory
-	mkdir -p ${paths.reportPath("cov", params.runID)}
-	# create coverage report
-	${params.pipelineDir}/scripts/statistics.pl -r ${params.ccdsBED} -b ${bamFile} -o ${paths.reportPath("cov", params.runID)}/${params.runID} -d 
-	"""
+    script:
+    """
+    set -x
+    # create output directory
+    mkdir -p out
+    # create coverage report
+    ${params.pipelineDir}/scripts/statistics.pl -r ${params.ccdsBED} -b ${bamFile} -o ${runID} -d 
+    """
 }
+
+copyHelper.copyFiles(coverageReportOut, "reports/coverage")
 
 // --------------------------------------------------------------------------
 // Run Qualimap on finalBAM
 // --------------------------------------------------------------------------
 
 process runQualimap {
-	cpus params.cpus.qualimap
-	module "qualimap/2.0"
+    cpus params.cpus.qualimap
+    module "qualimap/2.0"
 
-	input:
-	file bamFile from finalBAMForQualimap
-	file baiFile from finalBAIForQualimap
+    input:
+    set runID, file(bamFile), file(baiFile) from finalAlignmentForQualimap
 
-	output:
+    output:
+    file("${runID}.zip") into qualimapReportOut
 
-	script:
-	"""
-	set -x
-	# create output directory
-	mkdir -p ${paths.reportPath("qualimap", params.runID)}
-	# create quality report with Qualimap
-	qualimap bamqc --java-mem-size=10G -c -gd HUMAN -os -nt ${params.cpus.qualimap} -gff ${params.ccdsBED} -bam ${bamFile} -outdir ${paths.reportPath("qualimap", params.runID)}/`basename ${bamFile}` 
-	"""
+    script:
+    """
+    set -x
+    # create output directory
+    mkdir ${runID}
+    # create quality report with Qualimap
+    qualimap bamqc --java-mem-size=10G -c -gd HUMAN -os -nt ${params.cpus.qualimap} -gff ${params.ccdsBED} -bam ${bamFile} -outdir ${runID}
+    # zip output directory for copying out
+    zip -r ${runID}.zip ${runID}
+    """
 }
+
+copyHelper.copyFiles(qualimapReportOut, "reports/qualimap", true)
 
 // --------------------------------------------------------------------------
 // Run Variant Calling on Postprocessed BAM File
 // --------------------------------------------------------------------------
 
-// TODO(holtgrewe): Put postprocessing into its own process.
-
 process runVariantCalling {
-	cpus params.cpus.variantCalling
-	module 'gatk/3.3-0'
+    cpus params.cpus.variantCalling
+    module 'freebayes/0.9.20'
+    module 'vcflib'  // currently not versionized :(
 
-	input:
-	file bamFile from finalBAMForVariantCalling
-	file baiFile from finalBAIForVariantCalling
+    input:
+    genomeFile
+    set runID, file(bamFile), file(baiFile) from finalAlignmentForVariantCalling
 
-	output:
-	file "${bamFile}.vcf" into rawVCF
-//	file "${params.runID}.jv.vcf" into jannovarVCF
-//	file "${params.runID}.jv.ccds.vcf" into ccdsJannovarVCF
+    output:
+    file "*.vcf" into vcfOut
 
-	script:
-	"""
-	set -x
-	# create output directory
-	mkdir -p `dirname ${paths.vcfPath(params.runID)}`
-	# call variants with GATK's UnifiedGenotyper
-	java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T UnifiedGenotyper -R ${genomeFile}.fasta -allowPotentiallyMisencodedQuals -glm BOTH --dbsnp ${params.dbSnp} -dcov 200 -I ${bamFile} -nct ${params.cpus.variantCalling} -o ${paths.vcfPath(params.runID + ".vcf")}
-	ln -s ${paths.vcfPath(params.runID + ".vcf")} ${bamFile}.vcf
-	"""
+    script:
+    """
+    set -x
+    # call variants in parallel
+    freebayes-parallel <(fasta_generate_regions.py ${genomeFile}.fai 100000) ${params.cpus.variantCalling} -f ${genomeFile} ${bamFile} >tmp/${params.runID}.vcf
+    # introduce contig=<..> fields into the header
+    mkdir -p tmp
+    awk '/^@SQ/ { print "##contig=<ID="substr(\$2, 4) ",length" substr(\$3,4) ",md5=" substr(\$5,4) ">"}' ${params.genomeDict} > tmp/contigs_header.vcf
+    grep '^#' tmp/${params.runID}.vcf > tmp/${params.runID}.vcf
+    cat contigs_header.vcf >> tmp/${params.runID}.vcf
+    grep -v '^#' tmp/${params.runID}.vcf >> ${params.runID}.vcf
+    """
 }
 
-// --------------------------------------------------------------------------
-// Run Postprocessing on VCF File
-// --------------------------------------------------------------------------
-
-/* CURRENTLY DISABLED
-process runVCFPostprocessing {
-	cpus params.cpus.vcfPostprocess
-	
-	input:
-	file vcfFile from rawVCF
-	
-	output:
-	// file "${vcfFile}.jv.vcf" into jannovarVCF
-	// file "${vcfFile}.jv.ccds.vcf" into ccdsJannovarVCF
-	
-	script:
-	"""
-	set -x
-	# TODO(holtgrem): RUN
-	"""
-}
-*/
+copyHelper.copyFiles(vcfOut, "vcf");
