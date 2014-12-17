@@ -50,7 +50,7 @@ process runFastQCOriginal {
     """
 }
 
-copyHelper.copyFiles(fastqcOutputOriginal, "fastqc/original");
+copyHelper.copyFiles(fastqcOutputOriginal, "reports/fastqc-original");
 
 // --------------------------------------------------------------------------
 // Run read trimming on the original reads 
@@ -113,7 +113,7 @@ process runFastQCTrimmed {
     """
 }
 
-copyHelper.copyFiles(fastqcOutputTrimmed, "fastqc/trimmed");
+copyHelper.copyFiles(fastqcOutputTrimmed, "reports/fastqc-trimmed");
 
 // --------------------------------------------------------------------------
 // Run Read Mapping
@@ -137,7 +137,7 @@ process runReadMapping {
 
     """
     set -x
-    bwa mem -R '@RG\\tID:${runID}\\tSM:${runID}' -t ${params.cpus.alignment.map} ${genomeFile} ${readL} ${readR} | samtools view -Sb -u - | samtools sort -@ ${params.cpus.alignment.sort} -m 1G - alignment
+    bwa mem -R '@RG\\tID:${runID}\\tSM:${runID}\\tPL:${params.runPlatform}' -t ${params.cpus.alignment.map} ${genomeFile} ${readL} ${readR} | samtools view -Sb -u - | samtools sort -@ ${params.cpus.alignment.sort} -m 1G - alignment
     """
 }
 
@@ -157,8 +157,8 @@ process runMergeAndMarkDuplicates {
     set runID, bamFiles from jointBams
 
     output:
-    file("${runID}.mkdup.*") into finalAlignmentsOut
-    set runID, file("${runID}.mkdup.bam"), file("${runID}.mkdup.bai") into finalAlignments
+    file("${runID}.mkdup.*") into markedAlignmentsOut
+    set runID, file("${runID}.mkdup.bam"), file("${runID}.mkdup.bai") into markedAlignments
     """
     #!/bin/bash
     set -x
@@ -179,11 +179,11 @@ process runMergeAndMarkDuplicates {
     """
 }
 
-copyHelper.copyFiles(finalAlignmentsOut, "bam");
+copyHelper.copyFiles(markedAlignmentsOut, "bam");
 
-(finalAlignmentForCoverage,
- finalAlignmentForQualimap,
- finalAlignmentForVariantCalling) = finalAlignments.separate(3) { x -> [ x, x, x ] }
+(markedAlignmentForCoverage,
+ markedAlignmentForQualimap,
+ markedAlignmentForVariantCalling) = markedAlignments.separate(3) { x -> [ x, x, x ] }
 
 // --------------------------------------------------------------------------
 // Run BAM Coverage Tools on finalBAM
@@ -196,7 +196,7 @@ process runCoverageAnalysis {
     module "bedtools2/2.22.0"
 
     input:
-    set runID, file(bamFile), file(baiFile) from finalAlignmentForCoverage
+    set runID, file(bamFile), file(baiFile) from markedAlignmentForCoverage
 
     output:
     file("${runID}.*") into coverageReportOut
@@ -222,7 +222,7 @@ process runQualimap {
     module "qualimap/2.0"
 
     input:
-    set runID, file(bamFile), file(baiFile) from finalAlignmentForQualimap
+    set runID, file(bamFile), file(baiFile) from markedAlignmentForQualimap
 
     output:
     file("${runID}.zip") into qualimapReportOut
@@ -241,6 +241,8 @@ process runQualimap {
 
 copyHelper.copyFiles(qualimapReportOut, "reports/qualimap", true)
 
+if (params.caller == "freebayes") { 
+
 // --------------------------------------------------------------------------
 // Run Variant Calling on Postprocessed BAM File
 // --------------------------------------------------------------------------
@@ -252,7 +254,7 @@ process runVariantCalling {
 
     input:
     genomeFile
-    set runID, file(bamFile), file(baiFile) from finalAlignmentForVariantCalling
+    set runID, file(bamFile), file(baiFile) from markedAlignmentForVariantCalling
 
     output:
     file "*.vcf" into vcfOut
@@ -261,7 +263,7 @@ process runVariantCalling {
     """
     set -x
     # call variants in parallel
-    freebayes-parallel <(fasta_generate_regions.py ${genomeFile}.fai 100000) ${params.cpus.variantCalling} -f ${genomeFile} ${bamFile} >tmp/${params.runID}.vcf
+    freebayes-parallel <(fasta_generate_regions.py ${genomeFile}.fai 100000) ${params.cpus.freebayes} -f ${genomeFile} ${bamFile} >tmp/${params.runID}.vcf
     # introduce contig=<..> fields into the header
     mkdir -p tmp
     awk '/^@SQ/ { print "##contig=<ID="substr(\$2, 4) ",length" substr(\$3,4) ",md5=" substr(\$5,4) ">"}' ${params.genomeDict} > tmp/contigs_header.vcf
@@ -272,3 +274,93 @@ process runVariantCalling {
 }
 
 copyHelper.copyFiles(vcfOut, "vcf");
+
+} else { // if (params.caller == "freebayes")
+
+// --------------------------------------------------------------------------
+// Run BAM Realignment
+// --------------------------------------------------------------------------
+
+// Note that we are using time before the java commands below because
+// otherwise, we do not get a per-command time report.
+
+process runBAMRealignment {
+ cpus params.cpus.postproc
+ module 'gatk/3.3-0'
+
+ input:
+ set runID, file(bamFile), file(baiFile) from markedAlignmentForVariantCalling
+
+ output:
+ set file("${bamFile}.intervals"), file("${runID}.mkdup.ra.*") into realignedOut
+ set runID, file("${runID}.mkdup.ra.bam"), file("${runID}.mkdup.ra.bai") into realigned
+
+ """
+ set -x
+ # create realignment target intervals
+ time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T RealignerTargetCreator -R ${genomeFile} --known ${params.oneKGenomes} --known ${params.mills} -nt ${params.cpus.postproc} -I ${bamFile} -o ${bamFile}.intervals
+ # perform indel realignment
+ time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T IndelRealigner -R ${genomeFile} -known ${params.oneKGenomes} -known ${params.mills} -I ${bamFile} -o ${runID}.mkdup.ra.bam --targetIntervals ${bamFile}.intervals
+ """
+}
+
+copyHelper.copyFiles(realignedOut, "bam");
+
+// --------------------------------------------------------------------------
+// Run BAM Recalibration
+// --------------------------------------------------------------------------
+
+// Note that we are using time before the java commands below because
+// otherwise, we do not get a per-command time report.
+
+process runBAMRecalibration {
+ cpus params.cpus.postproc
+ module 'gatk/3.3-0'
+
+ input:
+ genomeFile
+ set runID, file(bamFile), file(baiFile) from realigned
+
+ output:
+ set file("${runID}.mkdup.ra.rc.*") into recalibratedAlignmentOut
+ set runID, file("${runID}.mkdup.ra.rc.bam"), file("${runID}.mkdup.ra.rc.bai") into recalibratedAlignment
+
+ """
+ set -x
+ # perform base recalibration, then print reads
+ time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T BaseRecalibrator -R ${genomeFile} -knownSites ${params.dbSnp} -nct ${params.cpus.gatkRecalibrator} -I ${bamFile} -o ${bamFile}.recal
+ time java -Xmx8g org.broadinstitute.gatk.engine.CommandLineGATK -T PrintReads -R ${genomeFile} --BQSR ${bamFile}.recal -nct ${params.cpus.gatkPrintReads} -I ${bamFile} -o ${runID}.mkdup.ra.rc.bam
+ """
+}
+
+copyHelper.copyFiles(recalibratedAlignmentOut, "bam")
+
+// --------------------------------------------------------------------------
+// Run Variant Calling on Postprocessed BAM File
+// --------------------------------------------------------------------------
+
+process runVariantCalling {
+ cpus params.cpus.variantCalling
+ module 'gatk/3.3-0'
+
+ input:
+ genomeFile
+ set runID, file(bamFile), file(baiFile) from recalibratedAlignment
+
+ output:
+ file "*.vcf" into vcfOut
+
+ script:
+ """
+ set -x
+ ## call variants with GATK's UnifiedGenotyper
+ #time java -Xmx64g org.broadinstitute.gatk.engine.CommandLineGATK -T UnifiedGenotyper -R ${genomeFile} -allowPotentiallyMisencodedQuals -glm BOTH --dbsnp ${params.dbSnp} -dcov 200 -I ${bamFile} -nct ${params.cpus.gatkUnifiedGenotyper} -o ${runID}.vcf
+ # call variants with GATK's HaplotypeCaller and GenotypeGVCFs
+ time java -Xmx64g org.broadinstitute.gatk.engine.CommandLineGATK -T HaplotypeCaller -R ${genomeFile} -nct ${params.cpus.gatkHaplotypeCaller} --emitRefConfidence GVCF --variant_index_type LINEAR --variant_index_parameter 128000 --dbsnp ${params.dbSnp} -I ${bamFile} -o ${runID}.g.vcf
+ time java -Xmx64g org.broadinstitute.gatk.engine.CommandLineGATK -T GenotypeGVCFs -R ${genomeFile} -nt ${params.cpus.gatkGenotypeGVCFs} --dbsnp ${params.dbSnp} --variant ${runID}.g.vcf -o ${params.runID}.vcf
+ """
+}
+
+copyHelper.copyFiles(vcfOut, "vcf");
+
+}  // if (params.caller == "freebayes")
